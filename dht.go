@@ -7,6 +7,7 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
+	//"fmt"
 	"net"
 	"strconv"
 	"sync"
@@ -262,6 +263,8 @@ func (d *dht) onReply(dict map[string]interface{}, from net.UDPAddr) {
 		return
 	}
 
+	//fmt.Printf("onReply nodes: %v ip: %s port: %s \n", nodes, from.IP, from.Port)
+
 	for _, node := range decodeNodes(nodes) {
 		if !d.friendsLimiter.Allow() {
 			continue
@@ -301,6 +304,8 @@ func (d *dht) onGetPeersQuery(dict map[string]interface{}, from net.UDPAddr) {
 		return
 	}
 
+	//fmt.Printf("onGetPeersQuery ip: %s port %s", from.IP, from.Port)
+
 	r := makeReply(tid, map[string]interface{}{
 		"id":    string(neighborID([]byte(id), d.localID)),
 		"nodes": "",
@@ -323,6 +328,8 @@ func (d *dht) onAnnouncePeerQuery(dict map[string]interface{}, from net.UDPAddr)
 	if !ok || !d.validateToken(token, from) {
 		return
 	}
+
+	//fmt.Printf("onAnnouncePeerQuery ip:%s port:%d name: %s hash: %s \n", from.IP, from.Port, a["name"], a["info_hash"].(string))
 
 	if ac := d.summarize(dict, from); ac != nil {
 		d.announcements.put(ac)

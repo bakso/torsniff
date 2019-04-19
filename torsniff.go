@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -11,10 +12,12 @@ import (
 	"strings"
 	"time"
 
+	"database/sql"
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/marksamman/bencode"
 	"github.com/mitchellh/go-homedir"
 	"github.com/spf13/cobra"
-	"go.etcd.io/etcd/pkg/fileutil"
+	//"go.etcd.io/etcd/pkg/fileutil"
 )
 
 const (
@@ -26,6 +29,11 @@ type tfile struct {
 	length int64
 }
 
+type TFile struct {
+	Name   string `json:"name"`
+	Length int64  `json:"length"`
+}
+
 func (t *tfile) String() string {
 	return fmt.Sprintf("name: %s\n, size: %d\n", t.name, t.length)
 }
@@ -34,16 +42,20 @@ type torrent struct {
 	infohashHex string
 	name        string
 	length      int64
+	pieceLength int64
 	files       []*tfile
+	TFiles      []*TFile
 }
 
 func (t *torrent) String() string {
+	jsonBytes, _ := json.Marshal(t.TFiles)
 	return fmt.Sprintf(
-		"link: %s\nname: %s\nsize: %d\nfile: %d\n",
+		"link: %s\nname: %s\nsize: %d\nfileNum: %d\n, files: %s\n",
 		fmt.Sprintf("magnet:?xt=urn:btih:%s", t.infohashHex),
 		t.name,
 		t.length,
 		len(t.files),
+		string(jsonBytes),
 	)
 }
 
@@ -61,6 +73,10 @@ func parseTorrent(meta []byte, infohashHex string) (*torrent, error) {
 	}
 	if length, ok := dict["length"].(int64); ok {
 		t.length = length
+	}
+
+	if pieceLength, ok := dict["piece length"].(int64); ok {
+		t.pieceLength = pieceLength
 	}
 
 	var totalSize int64
@@ -85,6 +101,7 @@ func parseTorrent(meta []byte, infohashHex string) (*torrent, error) {
 			totalSize += filelength
 		}
 		t.files = append(t.files, &tfile{name: filename, length: filelength})
+		t.TFiles = append(t.TFiles, &TFile{Name: filename, Length: filelength})
 	}
 
 	if files, ok := dict["files"].([]interface{}); ok {
@@ -100,6 +117,7 @@ func parseTorrent(meta []byte, infohashHex string) (*torrent, error) {
 	}
 	if len(t.files) == 0 {
 		t.files = append(t.files, &tfile{name: t.name, length: t.length})
+		t.TFiles = append(t.TFiles, &TFile{Name: t.name, Length: t.length})
 	}
 
 	return t, nil
@@ -113,6 +131,7 @@ type torsniff struct {
 	timeout    time.Duration
 	blacklist  *blackList
 	dir        string
+	db         *sql.DB
 }
 
 func (t *torsniff) run() error {
@@ -122,6 +141,12 @@ func (t *torsniff) run() error {
 	if err != nil {
 		return err
 	}
+
+	db, err := sql.Open("mysql", "torsniff:taobao1234@/torrent?charset=utf8mb4")
+	if err != nil {
+		return err
+	}
+	t.db = db
 
 	dht.run()
 
@@ -151,10 +176,6 @@ func (t *torsniff) work(ac *announcement, tokens chan struct{}) {
 		<-tokens
 	}()
 
-	if t.isTorrentExist(ac.infohashHex) {
-		return
-	}
-
 	peerAddr := ac.peer.String()
 	if t.blacklist.has(peerAddr) {
 		return
@@ -169,11 +190,12 @@ func (t *torsniff) work(ac *announcement, tokens chan struct{}) {
 		return
 	}
 
-	if err := t.saveTorrent(ac.infohashHex, meta); err != nil {
+	torrent, err := parseTorrent(meta, ac.infohashHex)
+
+	if err := t.saveTorrent(ac.infohashHex, meta, torrent); err != nil {
 		return
 	}
 
-	torrent, err := parseTorrent(meta, ac.infohashHex)
 	if err != nil {
 		return
 	}
@@ -181,8 +203,8 @@ func (t *torsniff) work(ac *announcement, tokens chan struct{}) {
 	log.Println(torrent)
 }
 
-func (t *torsniff) isTorrentExist(infohashHex string) bool {
-	name, _ := t.torrentPath(infohashHex)
+func (t *torsniff) isTorrentExist(infohashHex string, torrent *torrent) bool {
+	name, _ := t.torrentPath(infohashHex, torrent)
 	_, err := os.Stat(name)
 	if os.IsNotExist(err) {
 		return false
@@ -190,36 +212,40 @@ func (t *torsniff) isTorrentExist(infohashHex string) bool {
 	return err == nil
 }
 
-func (t *torsniff) saveTorrent(infohashHex string, data []byte) error {
-	name, dir := t.torrentPath(infohashHex)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
+func (t *torsniff) saveTorrent(infohashHex string, data []byte, torrent *torrent) error {
+
+	rs := t.db.QueryRow("select id from info where hash=?", infohashHex)
+
+	var count int64
+	err := rs.Scan(&count)
+	switch err {
+	case sql.ErrNoRows: // 没有数据说明可以插入直接跳过
+		break
+	case nil:
+		// 查得到说明存在重复的 hash
+		fmt.Printf("duplicate hash: %s count: %d \n", infohashHex, count)
+		return nil
+	default:
+		fmt.Printf("unknown error %v %d \n", err, count)
+		return nil
 	}
 
-	d, err := bencode.Decode(bytes.NewBuffer(data))
-	if err != nil {
-		return err
-	}
+	jsonBytes, err := json.Marshal(torrent.TFiles)
+	//fmt.Printf("%v %v", torrent.TFiles, jsonBytes)
+	stmt, err := t.db.Prepare("insert into info (hash, name, piece_length, files_number, total_length, files) values (?, ?, ?, ?, ?, ?)")
+	_, err = stmt.Exec(infohashHex, torrent.name, torrent.pieceLength, len(torrent.files), torrent.length, string(jsonBytes))
 
-	f, err := fileutil.TryLockFile(name, os.O_RDWR|os.O_CREATE, 0755)
 	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	_, err = f.Write(bencode.Encode(map[string]interface{}{
-		"info": d,
-	}))
-	if err != nil {
+		fmt.Printf("insert sql error, %v \n", err)
 		return err
 	}
 
 	return nil
 }
 
-func (t *torsniff) torrentPath(infohashHex string) (name string, dir string) {
-	dir = path.Join(t.dir, infohashHex[:2], infohashHex[len(infohashHex)-2:])
-	name = path.Join(dir, infohashHex+".torrent")
+func (t *torsniff) torrentPath(infohashHex string, torrent *torrent) (name string, dir string) {
+	dir = t.dir
+	name = path.Join(dir, torrent.name+".torrent")
 	return
 }
 
@@ -270,9 +296,9 @@ func main() {
 	}
 
 	root.Flags().StringVarP(&addr, "addr", "a", "0.0.0.0", "listen on given address")
-	root.Flags().Uint16VarP(&port, "port", "p", 6881, "listen on given port")
-	root.Flags().IntVarP(&friends, "friends", "f", 500, "max fiends to make with per second")
-	root.Flags().IntVarP(&peers, "peers", "e", 400, "max peers to connect to download torrents")
+	root.Flags().Uint16VarP(&port, "port", "p", 6882, "listen on given port")
+	root.Flags().IntVarP(&friends, "friends", "f", 5000, "max fiends to make with per second")
+	root.Flags().IntVarP(&peers, "peers", "e", 5000, "max peers to connect to download torrents")
 	root.Flags().DurationVarP(&timeout, "timeout", "t", 10*time.Second, "max time allowed for downloading torrents")
 	root.Flags().StringVarP(&dir, "dir", "d", userHome, "the directory to store the torrents")
 	root.Flags().BoolVarP(&verbose, "verbose", "v", true, "run in verbose mode")
