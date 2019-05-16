@@ -307,7 +307,7 @@ func (d *dht) onGetPeersQuery(dict map[string]interface{}, from net.UDPAddr) {
 		return
 	}
 
-	fmt.Printf("onGetPeersQuery ip: %s port %d \n", from.IP, from.Port)
+	//fmt.Printf("onGetPeersQuery ip: %s port %d infohash %x\n", from.IP, from.Port, a["info_hash"])
 
 	r := makeReply(tid, map[string]interface{}{
 		"id":    string(neighborID([]byte(id), d.localID)),
@@ -318,6 +318,7 @@ func (d *dht) onGetPeersQuery(dict map[string]interface{}, from net.UDPAddr) {
 }
 
 func (d *dht) onAnnouncePeerQuery(dict map[string]interface{}, from net.UDPAddr) {
+	fmt.Println("receieve announce peer")
 	if d.announcements.full() {
 		return
 	}
@@ -332,7 +333,7 @@ func (d *dht) onAnnouncePeerQuery(dict map[string]interface{}, from net.UDPAddr)
 		return
 	}
 
-	fmt.Printf("onAnnouncePeerQuery ip:%s port:%d name: %s hash: %s \n", from.IP, from.Port, a["name"], hex.EncodeToString([]byte(a["info_hash"].(string))))
+	fmt.Printf("%x onAnnouncePeerQuery ip:%s port:%d name: %s \n", a["info_hash"], from.IP, from.Port, a["name"])
 
 	if ac := d.summarize(dict, from); ac != nil {
 		d.announcements.put(ac)

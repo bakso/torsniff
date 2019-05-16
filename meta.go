@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/marksamman/bencode"
-	//"github.com/oschwald/geoip2-golang"
+	"github.com/oschwald/geoip2-golang"
 	"golang.org/x/net/proxy"
 )
 
@@ -28,7 +30,6 @@ var (
 	errExtHeader    = errors.New("invalid extension header response")
 	errInvalidPiece = errors.New("invalid piece response")
 	errTimeout      = errors.New("time out")
-	//ipdb            = nil
 )
 
 var metaWirePool = sync.Pool{
@@ -40,6 +41,7 @@ var metaWirePool = sync.Pool{
 type metaWire struct {
 	infohash     string
 	from         string
+	fromAddr     net.Addr
 	peerID       string
 	conn         *net.TCPConn
 	timeout      time.Duration
@@ -49,10 +51,14 @@ type metaWire struct {
 	pieces       [][]byte
 	err          error
 	dialer       proxy.Dialer
+	ipdb         *geoip2.Reader
 }
 
-func newMetaWire(infohash string, from string, timeout time.Duration, dialer proxy.Dialer) *metaWire {
+func newMetaWire(infohash string, fromAddr net.Addr, timeout time.Duration, dialer proxy.Dialer, ipdb *geoip2.Reader) *metaWire {
 	w := metaWirePool.Get().(*metaWire)
+
+	w.fromAddr = fromAddr
+	from := fromAddr.String()
 	w.infohash = infohash
 	w.from = from
 	w.peerID = string(randBytes(20))
@@ -61,6 +67,8 @@ func newMetaWire(infohash string, from string, timeout time.Duration, dialer pro
 	w.err = nil
 
 	w.dialer = dialer
+	w.ipdb = ipdb
+
 	return w
 }
 
@@ -112,11 +120,36 @@ func (mw *metaWire) fetchCtx(ctx context.Context) ([]byte, error) {
 }
 
 func (mw *metaWire) connect(ctx context.Context) {
+	from := mw.from
+	addr := strings.Split(from, ":")
 
-	//conn, err := net.DialTimeout("tcp", mw.from, mw.timeout)
-	conn, err := mw.dialer.Dial("tcp", mw.from)
+	ip := net.ParseIP(addr[0])
+	record, err := mw.ipdb.Country(ip)
 	if err != nil {
-		mw.err = fmt.Errorf("connect to remote peer failed: %v", err)
+		log.Fatal(err)
+	}
+
+	var conn net.Conn
+
+	country := record.Country.Names["en"]
+	fmt.Printf("Fetch directly, country: %s\n", country)
+	conn, err = net.DialTimeout("tcp", mw.from, mw.timeout)
+	if err != nil {
+		derr := fmt.Errorf("Fetch directly fail. err: %v\n", err)
+		if country != "China" {
+			fmt.Println(derr)
+			fmt.Printf("Try fetch by proxy fallback, country: %s\n", country)
+			conn, err = mw.dialer.Dial("tcp", mw.from)
+			if err != nil {
+				err = fmt.Errorf("Fetch by proxy fallback, fail: %v\n", err)
+				fmt.Println(err)
+				mw.err = err
+				return
+			}
+			mw.conn = conn.(*net.TCPConn)
+			return
+		}
+		mw.err = derr
 		return
 	}
 

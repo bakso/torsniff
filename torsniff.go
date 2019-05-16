@@ -17,6 +17,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/marksamman/bencode"
 	"github.com/mitchellh/go-homedir"
+	"github.com/oschwald/geoip2-golang"
 	"github.com/spf13/cobra"
 	"golang.org/x/net/proxy"
 	//"go.etcd.io/etcd/pkg/fileutil"
@@ -135,6 +136,7 @@ type torsniff struct {
 	dir        string
 	db         *sql.DB
 	dialer     proxy.Dialer
+	ipdb       *geoip2.Reader
 }
 
 func (t *torsniff) run() error {
@@ -218,7 +220,7 @@ func (t *torsniff) work(ac *announcement, tokens chan struct{}) {
 
 	fmt.Printf("start fetch infohash %s meta from %s \n", ac.infohashHex, peerAddr)
 
-	wire := newMetaWire(string(ac.infohash), peerAddr, t.timeout, t.dialer)
+	wire := newMetaWire(string(ac.infohash), ac.peer, t.timeout, t.dialer, t.ipdb)
 	defer wire.free()
 
 	meta, err := wire.fetch()
@@ -303,6 +305,12 @@ func main() {
 			log.SetOutput(os.Stdout)
 		}
 
+		ipdb, err := geoip2.Open("GeoLite2-Country/GeoLite2-Country.mmdb")
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer ipdb.Close()
+
 		p := &torsniff{
 			laddr:      fmt.Sprintf("%s:%d", addr, port),
 			timeout:    timeout,
@@ -311,6 +319,7 @@ func main() {
 			secret:     string(randBytes(20)),
 			dir:        absDir,
 			blacklist:  newBlackList(5*time.Minute, 50000),
+			ipdb:       ipdb,
 		}
 		return p.run()
 	}
