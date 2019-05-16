@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net"
 	"os"
 	"path"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"github.com/marksamman/bencode"
 	"github.com/mitchellh/go-homedir"
 	"github.com/spf13/cobra"
+	"golang.org/x/net/proxy"
 	//"go.etcd.io/etcd/pkg/fileutil"
 )
 
@@ -132,10 +134,23 @@ type torsniff struct {
 	blacklist  *blackList
 	dir        string
 	db         *sql.DB
+	dialer     proxy.Dialer
 }
 
 func (t *torsniff) run() error {
 	tokens := make(chan struct{}, t.maxPeers)
+	dialer, err := proxy.SOCKS5("tcp", "127.0.0.1:1080",
+		nil,
+		&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 20 * time.Second,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("proxy connect error", err)
+	}
+	t.dialer = dialer
+	fmt.Println("proxy connect ok")
 
 	dht, err := newDHT(t.laddr, t.maxFriends)
 	if err != nil {
@@ -158,6 +173,7 @@ func (t *torsniff) run() error {
 			for {
 				if ac := dht.announcements.get(); ac != nil {
 					tokens <- struct{}{}
+					fmt.Printf("work infohash: %s \n", ac.infohashHex)
 					go t.work(ac, tokens)
 					continue
 				}
@@ -176,27 +192,48 @@ func (t *torsniff) work(ac *announcement, tokens chan struct{}) {
 		<-tokens
 	}()
 
-	peerAddr := ac.peer.String()
-	if t.blacklist.has(peerAddr) {
+	infohashHex := ac.infohashHex
+	rs := t.db.QueryRow("select id from info where hash=?", infohashHex)
+
+	var id int64
+	err := rs.Scan(&id)
+	switch err {
+	case sql.ErrNoRows: // 没有数据说明可以插入直接跳过
+		break
+	case nil:
+		// 查得到说明存在重复的 hash
+		fmt.Printf("skip duplicate hash: %s id: %d \n", infohashHex, id)
+		return
+	default:
+		fmt.Printf("sql error %v %d \n", err, id)
 		return
 	}
 
-	wire := newMetaWire(string(ac.infohash), peerAddr, t.timeout)
+	peerAddr := ac.peer.String()
+
+	if t.blacklist.has(peerAddr) {
+		fmt.Printf("address %s is in blacklist\n", peerAddr)
+		return
+	}
+
+	fmt.Printf("start fetch infohash %s meta from %s \n", ac.infohashHex, peerAddr)
+
+	wire := newMetaWire(string(ac.infohash), peerAddr, t.timeout, t.dialer)
 	defer wire.free()
 
 	meta, err := wire.fetch()
 	if err != nil {
 		t.blacklist.add(peerAddr)
+		fmt.Printf("address %s is added in blacklist\n", peerAddr)
 		return
 	}
+
+	fmt.Printf("end fetch infohash %s from %s \n", ac.infohashHex, peerAddr)
 
 	torrent, err := parseTorrent(meta, ac.infohashHex)
 
 	if err := t.saveTorrent(ac.infohashHex, meta, torrent); err != nil {
-		return
-	}
-
-	if err != nil {
+		fmt.Println(err)
 		return
 	}
 
@@ -214,30 +251,13 @@ func (t *torsniff) isTorrentExist(infohashHex string, torrent *torrent) bool {
 
 func (t *torsniff) saveTorrent(infohashHex string, data []byte, torrent *torrent) error {
 
-	rs := t.db.QueryRow("select id from info where hash=?", infohashHex)
-
-	var count int64
-	err := rs.Scan(&count)
-	switch err {
-	case sql.ErrNoRows: // 没有数据说明可以插入直接跳过
-		break
-	case nil:
-		// 查得到说明存在重复的 hash
-		fmt.Printf("duplicate hash: %s count: %d \n", infohashHex, count)
-		return nil
-	default:
-		fmt.Printf("unknown error %v %d \n", err, count)
-		return nil
-	}
-
 	jsonBytes, err := json.Marshal(torrent.TFiles)
 	//fmt.Printf("%v %v", torrent.TFiles, jsonBytes)
 	stmt, err := t.db.Prepare("insert into info (hash, name, piece_length, files_number, total_length, files) values (?, ?, ?, ?, ?, ?)")
 	_, err = stmt.Exec(infohashHex, torrent.name, torrent.pieceLength, len(torrent.files), torrent.length, string(jsonBytes))
 
 	if err != nil {
-		fmt.Printf("insert sql error, %v \n", err)
-		return err
+		return fmt.Errorf("insert sql error, %v \n", err)
 	}
 
 	return nil
@@ -296,10 +316,10 @@ func main() {
 	}
 
 	root.Flags().StringVarP(&addr, "addr", "a", "0.0.0.0", "listen on given address")
-	root.Flags().Uint16VarP(&port, "port", "p", 6882, "listen on given port")
-	root.Flags().IntVarP(&friends, "friends", "f", 5000, "max fiends to make with per second")
-	root.Flags().IntVarP(&peers, "peers", "e", 5000, "max peers to connect to download torrents")
-	root.Flags().DurationVarP(&timeout, "timeout", "t", 10*time.Second, "max time allowed for downloading torrents")
+	root.Flags().Uint16VarP(&port, "port", "p", 13777, "listen on given port")
+	root.Flags().IntVarP(&friends, "friends", "f", 1200, "max fiends to make with per second")
+	root.Flags().IntVarP(&peers, "peers", "e", 1200, "max peers to connect to download torrents")
+	root.Flags().DurationVarP(&timeout, "timeout", "t", 20*time.Second, "max time allowed for downloading torrents")
 	root.Flags().StringVarP(&dir, "dir", "d", userHome, "the directory to store the torrents")
 	root.Flags().BoolVarP(&verbose, "verbose", "v", true, "run in verbose mode")
 

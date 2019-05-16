@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/marksamman/bencode"
+	//"github.com/oschwald/geoip2-golang"
+	"golang.org/x/net/proxy"
 )
 
 const (
@@ -26,6 +28,7 @@ var (
 	errExtHeader    = errors.New("invalid extension header response")
 	errInvalidPiece = errors.New("invalid piece response")
 	errTimeout      = errors.New("time out")
+	//ipdb            = nil
 )
 
 var metaWirePool = sync.Pool{
@@ -45,9 +48,10 @@ type metaWire struct {
 	numOfPieces  int
 	pieces       [][]byte
 	err          error
+	dialer       proxy.Dialer
 }
 
-func newMetaWire(infohash string, from string, timeout time.Duration) *metaWire {
+func newMetaWire(infohash string, from string, timeout time.Duration, dialer proxy.Dialer) *metaWire {
 	w := metaWirePool.Get().(*metaWire)
 	w.infohash = infohash
 	w.from = from
@@ -55,6 +59,8 @@ func newMetaWire(infohash string, from string, timeout time.Duration) *metaWire 
 	w.timeout = timeout
 	w.conn = nil
 	w.err = nil
+
+	w.dialer = dialer
 	return w
 }
 
@@ -106,7 +112,9 @@ func (mw *metaWire) fetchCtx(ctx context.Context) ([]byte, error) {
 }
 
 func (mw *metaWire) connect(ctx context.Context) {
-	conn, err := net.DialTimeout("tcp", mw.from, mw.timeout)
+
+	//conn, err := net.DialTimeout("tcp", mw.from, mw.timeout)
+	conn, err := mw.dialer.Dial("tcp", mw.from)
 	if err != nil {
 		mw.err = fmt.Errorf("connect to remote peer failed: %v", err)
 		return
@@ -367,3 +375,5 @@ func (mw *metaWire) write(ctx context.Context, data []byte) error {
 func (mw *metaWire) free() {
 	metaWirePool.Put(mw)
 }
+
+//ipdb, err = geoip2.Open("GeoIP2-City.mmdb")
