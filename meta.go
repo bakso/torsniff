@@ -5,18 +5,19 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/marksamman/bencode"
 	"github.com/oschwald/geoip2-golang"
-	"golang.org/x/net/proxy"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -50,23 +51,33 @@ type metaWire struct {
 	numOfPieces  int
 	pieces       [][]byte
 	err          error
-	dialer       proxy.Dialer
 	ipdb         *geoip2.Reader
+	logger       *logrus.Entry
 }
 
-func newMetaWire(infohash string, fromAddr net.Addr, timeout time.Duration, dialer proxy.Dialer, ipdb *geoip2.Reader) *metaWire {
-	w := metaWirePool.Get().(*metaWire)
+func newMetaWire(infohash []byte, fromAddr net.Addr, timeout time.Duration, ipdb *geoip2.Reader) *metaWire {
+	logger := logrus.New()
+	logger.Out = os.Stdout
 
+	logger.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp: true,
+	})
+
+	w := metaWirePool.Get().(*metaWire)
+	_infohash := hex.EncodeToString(infohash)
+	w.logger = logger.WithFields(logrus.Fields{
+		"infohash": _infohash,
+		"step":     "metaWire",
+	})
 	w.fromAddr = fromAddr
 	from := fromAddr.String()
-	w.infohash = infohash
+	w.infohash = string(infohash)
 	w.from = from
 	w.peerID = string(randBytes(20))
 	w.timeout = timeout
 	w.conn = nil
 	w.err = nil
 
-	w.dialer = dialer
 	w.ipdb = ipdb
 
 	return w
@@ -95,6 +106,10 @@ func (mw *metaWire) fetchCtx(ctx context.Context) ([]byte, error) {
 		data, err := mw.next(ctx)
 		if err != nil {
 			return nil, err
+		}
+
+		if data == nil {
+			return nil, errors.New("fetch data is Null")
 		}
 
 		if data[0] != extended {
@@ -132,24 +147,11 @@ func (mw *metaWire) connect(ctx context.Context) {
 	var conn net.Conn
 
 	country := record.Country.Names["en"]
-	fmt.Printf("Fetch directly, country: %s\n", country)
+	mw.logger.Infof("Fetch directly, country: %s", country)
 	conn, err = net.DialTimeout("tcp", mw.from, mw.timeout)
 	if err != nil {
-		derr := fmt.Errorf("Fetch directly fail. err: %v\n", err)
-		if country != "China" {
-			fmt.Println(derr)
-			fmt.Printf("Try fetch by proxy fallback, country: %s\n", country)
-			conn, err = mw.dialer.Dial("tcp", mw.from)
-			if err != nil {
-				err = fmt.Errorf("Fetch by proxy fallback, fail: %v\n", err)
-				fmt.Println(err)
-				mw.err = err
-				return
-			}
-			mw.conn = conn.(*net.TCPConn)
-			return
-		}
-		mw.err = derr
+		mw.logger.Errorf("Fetch directly fail. err: %v", err)
+		mw.err = err
 		return
 	}
 
@@ -380,7 +382,8 @@ func (mw *metaWire) read(ctx context.Context, size uint32) ([]byte, error) {
 	buf := bytes.NewBuffer(nil)
 	_, err := io.CopyN(buf, mw.conn, int64(size))
 	if err != nil {
-		return nil, fmt.Errorf("read %d bytes message failed: %v", size, err)
+		mw.logger.Errorf("read %d bytes message failed: %v", size, err)
+		return nil, err
 	}
 
 	return buf.Bytes(), nil
@@ -399,7 +402,8 @@ func (mw *metaWire) write(ctx context.Context, data []byte) error {
 	buf.Write(data)
 	_, err := mw.conn.Write(buf.Bytes())
 	if err != nil {
-		return fmt.Errorf("write message failed: %v", err)
+		mw.logger.Errorf("write message failed: %v", err)
+		return err
 	}
 
 	return nil
@@ -408,5 +412,3 @@ func (mw *metaWire) write(ctx context.Context, data []byte) error {
 func (mw *metaWire) free() {
 	metaWirePool.Put(mw)
 }
-
-//ipdb, err = geoip2.Open("GeoIP2-City.mmdb")

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"net"
 	"os"
 	"path"
 	"path/filepath"
@@ -19,8 +18,6 @@ import (
 	"github.com/mitchellh/go-homedir"
 	"github.com/oschwald/geoip2-golang"
 	"github.com/spf13/cobra"
-	"golang.org/x/net/proxy"
-	//"go.etcd.io/etcd/pkg/fileutil"
 )
 
 const (
@@ -135,25 +132,11 @@ type torsniff struct {
 	blacklist  *blackList
 	dir        string
 	db         *sql.DB
-	dialer     proxy.Dialer
 	ipdb       *geoip2.Reader
 }
 
 func (t *torsniff) run() error {
 	tokens := make(chan struct{}, t.maxPeers)
-	dialer, err := proxy.SOCKS5("tcp", "127.0.0.1:1080",
-		nil,
-		&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 20 * time.Second,
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("proxy connect error", err)
-	}
-	t.dialer = dialer
-	fmt.Println("proxy connect ok")
-
 	dht, err := newDHT(t.laddr, t.maxFriends)
 	if err != nil {
 		return err
@@ -220,13 +203,13 @@ func (t *torsniff) work(ac *announcement, tokens chan struct{}) {
 
 	fmt.Printf("start fetch infohash %s meta from %s \n", ac.infohashHex, peerAddr)
 
-	wire := newMetaWire(string(ac.infohash), ac.peer, t.timeout, t.dialer, t.ipdb)
+	wire := newMetaWire(ac.infohash, ac.peer, t.timeout, t.ipdb)
 	defer wire.free()
 
 	meta, err := wire.fetch()
 	if err != nil {
 		t.blacklist.add(peerAddr)
-		fmt.Printf("address %s is added in blacklist\n", peerAddr)
+		fmt.Printf("address %s is added in blacklist, reason: %v\n", peerAddr, err)
 		return
 	}
 
@@ -305,7 +288,7 @@ func main() {
 			log.SetOutput(os.Stdout)
 		}
 
-		ipdb, err := geoip2.Open("GeoLite2-Country/GeoLite2-Country.mmdb")
+		ipdb, err := geoip2.Open("/root/GeoLite2-Country/GeoLite2-Country.mmdb")
 		if err != nil {
 			log.Fatal(err)
 		}
